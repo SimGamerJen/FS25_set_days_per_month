@@ -1,117 +1,90 @@
-# FS25 Days Per Month Utility
+# FS25 Save Utilities – Days Per Month & Farm Resets
 
-This Python script updates **Farming Simulator 25** savegames to change the number of days per month (`daysPerPeriod`).  
-It also recalculates the `currentDay` value to keep your save consistent with the new configuration, clears cached weather forecast data, and updates **careerSavegame.xml** so that the in-game UI matches your chosen setting.
+A utility script for **Farming Simulator 25** savegames.
+
+This script helps you:
+- Change **days-per-month** (daysPerPeriod) in `environment.xml`.
+- Recalculate **currentDay** to preserve elapsed months when changing day length.
+- Clear cached **weather forecasts** so the game regenerates them on load.
+- Sync **plannedDaysPerPeriod** in `careerSavegame.xml`.
+- Reset **farm statistics** in `farms.xml` to zeros (without touching `<farmId>`).
+- Reset **farm finances** in `farms.xml` by zeroing all `<stats>` values inside `<finances>`.
 
 ---
 
 ## Features
 
-- ✅ Update `daysPerPeriod` inside `environment.xml`
-- ✅ Recompute `currentDay` based on the existing save values (correct for the default **August start** in new games)
-- ✅ Clear forecast/lastUpdate entries so FS25 regenerates weather data correctly
-- ✅ Update `plannedDaysPerPeriod` inside `careerSavegame.xml` so UI & engine stay in sync
-- ✅ Optional dry-run mode to preview changes without writing
-- ✅ Automatic `.bak.TIMESTAMP` backups before modifying files
+- **Days-per-month change**
+  - Adjusts `<daysPerPeriod>` to your desired length.
+  - Recomputes `<currentDay>` so progress stays consistent.
+  - Optionally keep the old day-in-month (`--keep-day`) or pick a new target day (`--day`).
+  - Clears forecast caches for consistency.
+  - Updates `careerSavegame.xml`’s `<plannedDaysPerPeriod>`.
+
+- **Statistics reset**
+  - `--reset-stats` zeros all values inside `<statistics>` for each farm.
+  - Preserves number style: `0` (integers) vs. `0.000000` (floats).
+  - Never touches `<farmId>`.
+
+- **Finances reset**
+  - `--reset-finances` zeros all values inside `<finances><stats>` blocks for each farm.
+  - Preserves number style as above.
+  - Keeps the `<finances>` structure intact.
+
+- **Safety**
+  - Timestamped `.bak` backups unless `--no-backup` is set.
+  - `--dry-run` mode to preview changes without touching files.
+  - Verbose output with `--verbose`.
 
 ---
 
 ## Usage
 
-```bash
-python set_days_per_month.py --save "path/to/savegame1" --days N [options]
+```powershell
+# Change to 3 days per month
+py .\set_days_per_month.py --save savegame1 --days 3 --verbose
+
+# Keep old day-in-month when changing
+py .\set_days_per_month.py --save savegame1 --days 3 --keep-day --verbose
+
+# Reset farm statistics only
+py .\set_days_per_month.py --save savegame1 --reset-stats --verbose
+
+# Reset farm finances only
+py .\set_days_per_month.py --save savegame1 --reset-finances --verbose
+
+# Reset both stats and finances
+py .\set_days_per_month.py --save savegame1 --reset-stats --reset-finances --verbose
+
+# Combine days change with resets
+py .\set_days_per_month.py --save savegame1 --days 3 --reset-stats --reset-finances --verbose
+
+# Preview (no file writes)
+py .\set_days_per_month.py --save savegame1 --days 3 --reset-stats --dry-run --verbose
 ````
-
-### Required arguments
-
-* `--save` : Path to your FS25 save folder (e.g. `.../FarmingSimulator2025/savegame1`)
-* `--days` : Desired number of days per month (1–28)
-
-### Optional arguments
-
-* `--target-day` : Day within the target month to use when recalculating (default: 1)
-* `--keep-day` : Keep the same day-in-month as before (clamped if necessary)
-* `--no-backup` : Skip creation of `.bak` backup files
-* `--dry-run` : Show calculations and changes without writing files
-
----
-
-## Examples
-
-Set 3 days per month, starting August Day 1 (fresh save example):
-
-```bash
-python set_days_per_month.py --save "E:/FS25/savegame1" --days 3
-```
-
-Keep the same day-in-month when moving to 7 days per month:
-
-```bash
-python set_days_per_month.py --save "E:/FS25/savegame1" --days 7 --keep-day
-```
-
-Preview what would happen with 5 days per month (no changes written):
-
-```bash
-python set_days_per_month.py --save "E:/FS25/savegame1" --days 5 --dry-run
-```
-
----
-
-## How It Works
-
-* **currentDay recalculation**
-  The script inspects the old values (e.g. `daysPerPeriod=1`, `currentDay=6` for a fresh save).
-  It infers how many months have already elapsed since March (`months_before=5` in this case).
-  With a new setting of 3 days per month, August Day 1 becomes:
-
-  ```
-  currentDay = (months_before * new_days) + target_day
-             = (5 * 3) + 1
-             = 16
-  ```
-
-  This keeps your timeline aligned.
-
-* **careerSavegame.xml update**
-  The `plannedDaysPerPeriod` field is updated so that the UI in FS25 reflects your new days-per-month setting.
-
-* **forecast reset**
-  Cached forecast nodes and lastUpdate timestamps are cleared to force FS25 to rebuild its weather on load.
 
 ---
 
 ## Roadmap
 
-Planned or possible future extensions:
+Planned enhancements:
 
-* 🔄 **Reset statistics and finances**
-  Add an option to reset player stats and account balances by editing `farms.xml`.
+* **Farm reset suite**:
 
-* 📅 **Change the starting month (safely)**
-  Support for jumping the starting month (e.g. from August to October).
-  This will **require a full field reset** (deleting density maps) to avoid growth/contract desync.
+  * More granular reset options (e.g., per-stat, per-finance-year).
+* **Save sanitization**:
 
-* 📊 **Enhanced verification mode**
-  Add a `--verify` option that prints before/after summaries of all relevant save values and highlights mismatches.
+  * Detect corrupted or missing XML nodes and auto-repair them.
+* **Configurable starting month**:
 
-* 💾 **Multi-file sync**
-  Optionally update `savegameSettings.xml` (used by some mods/maps) alongside `careerSavegame.xml`.
+  * Ability to change the campaign’s starting month (with a fields reset).
+* **Extended resets**:
 
----
-
-## Requirements
-
-* Python 3.9+
-* No third-party packages required (uses only Python standard library)
+  * Optional reset of mission history, statistics for specific categories, or crop growth.
 
 ---
 
-## Notes
+## Disclaimer
 
-* Run this script only when the game is **closed**.
-* Backups (`.bak.TIMESTAMP`) are created automatically unless you pass `--no-backup`.
-* Always test on a copy of your save first.
-
-```
-
+This script modifies your save files. Always make backups before running it on important saves.
+The script attempts to back up files automatically with a timestamped `.bak` extension.
