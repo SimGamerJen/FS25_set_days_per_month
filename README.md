@@ -1,4 +1,3 @@
-````markdown
 # FS25 Days Per Month Utility
 
 This Python script updates **Farming Simulator 25** savegames to change the number of days per month (`daysPerPeriod`).  
