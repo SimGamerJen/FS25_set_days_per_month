@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 # set_days_per_month.py
 #
-# FS25: update days-per-month (daysPerPeriod), recompute currentDay from existing values,
-# and clear cached forecast so the game rebuilds it on load.
-
+# FS25 utility:
+# - Update days-per-month (daysPerPeriod) in environment.xml
+# - Recompute currentDay to preserve progress across a days-per-month change
+# - Clear cached forecast so the game rebuilds it on load
+# - Sync plannedDaysPerPeriod in careerSavegame.xml
+# - Reset farms.xml <statistics> values to 0 / 0.000000 (skipping <farmId>)
+# - Remove all <stats> entries inside <finances> (per farm) in farms.xml
+#
+# Example usages:
+#   py .\set_days_per_month.py --save savegame1 --days 3 --verbose
+#   py .\set_days_per_month.py --save savegame1 --days 3 --keep-day --verbose
+#   py .\set_days_per_month.py --save savegame1 --reset-stats --verbose
+#   py .\set_days_per_month.py --save savegame1 --reset-finances --verbose
+#   py .\set_days_per_month.py --save savegame1 --days 3 --reset-stats --reset-finances --dry-run --verbose
+#
 import argparse
 import os
 import sys
 import shutil
 import datetime as dt
+import re
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
+from pathlib import Path
 
 POSSIBLE_ENV_PATHS = [
     "environment.xml",
@@ -18,32 +32,39 @@ POSSIBLE_ENV_PATHS = [
 ]
 
 PRIMARY_DAY_TAG = "daysPerPeriod"
-DAY_TAG_SYNONYMS = ["daysPerMonth", "periodLength"]
+DAY_TAG_SYNONYMS = ["daysPerMonth", "plannedDaysPerPeriod"]
 
-def find_env_xml(save_dir: str) -> str:
-    for rel in POSSIBLE_ENV_PATHS:
-        p = os.path.join(save_dir, rel)
-        if os.path.isfile(p):
-            return p
-    raise FileNotFoundError(
-        "Couldn't find environment.xml in the save folder. "
-    )
+# -------------------------
+# Pretty XML write / backup
+# -------------------------
+def pretty_write_xml(tree: ET.ElementTree, path: Path, dry_run: bool = False):
+    xml_bytes = ET.tostring(tree.getroot(), encoding="utf-8")
+    reparsed = minidom.parseString(xml_bytes)
+    pretty = reparsed.toprettyxml(indent="  ", encoding="utf-8")
+    if dry_run:
+        return
+    with open(path, "wb") as f:
+        f.write(pretty)
 
-def backup_file(path: str) -> str:
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    bak = f"{path}.bak.{stamp}"
-    shutil.copy2(path, bak)
+def timestamped_backup(path: Path) -> Path:
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    bak = path.with_suffix(path.suffix + f".{ts}.bak")
+    path.replace(bak)
     return bak
 
-def pretty_write_xml(tree: ET.ElementTree, dest_path: str):
-    rough = ET.tostring(tree.getroot(), encoding="utf-8")
-    parsed = minidom.parseString(rough)
-    with open(dest_path, "wb") as f:
-        f.write(parsed.toprettyxml(indent="  ", encoding="utf-8"))
+def ensure_exists(path: Path, label: str):
+    if not path.exists():
+        raise FileNotFoundError(f"{label} not found: {path}")
 
-def find_or(root: ET.Element, tag: str, default=None):
-    el = root.find(f".//{tag}")
-    return (el, (el.text if el is not None and el.text is not None else default))
+# -------------------------
+# XML helpers
+# -------------------------
+def find_environment_xml(save_dir: Path) -> Path:
+    for rel in POSSIBLE_ENV_PATHS:
+        candidate = save_dir / rel
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"environment.xml not found in {save_dir} (tried {POSSIBLE_ENV_PATHS})")
 
 def ensure_child(parent: ET.Element, tag: str) -> ET.Element:
     node = parent.find(tag)
@@ -62,178 +83,289 @@ def set_days_per_period(root: ET.Element, value: int):
 
 def clear_forecast(root: ET.Element) -> int:
     removed = 0
-    def _remove_children_named(parent: ET.Element, name: str):
+    def _remove_children_named(parent_xpath: str, child_tag: str):
         nonlocal removed
-        for child in list(parent):
-            if child.tag.lower().endswith(name.lower()):
+        for parent in root.findall(parent_xpath):
+            for child in list(parent.findall(child_tag)):
                 parent.remove(child)
                 removed += 1
-            else:
-                _remove_children_named(child, name)
-    _remove_children_named(root, "forecast")
-
-    for parent in root.iter():
-        tag_lower = parent.tag.lower()
-        if "variation" in tag_lower or "weatherpreset" in tag_lower:
-            for child in list(parent):
-                if child.tag.lower().endswith("object"):
-                    parent.remove(child)
-                    removed += 1
-
-    for el in root.iter():
-        if el.tag.lower().endswith("lastupdate"):
-            el.text = "0"
-
+    _remove_children_named(".//weatherForecast", "period")
+    _remove_children_named(".//weather", "object")
+    _remove_children_named(".//weatherObjects", "object")
     return removed
 
-def validate_days(n: int):
-    if n < 1 or n > 28:
-        raise ValueError("Days per month must be between 1 and 28.")
-
-def recompute_current_day(old_current: int, old_days: int, new_days: int, target_day: int, keep_day: bool):
-    """
-    Deduce how many whole months have already elapsed from the old settings,
-    then recompute currentDay for the new days-per-period.
-    """
-    if old_days < 1:
-        old_days = 1  # safety
-    # Day number within the current month under the *old* system:
+# -------------------------
+# Current day recompute
+# -------------------------
+def compute_new_current_day(old_current: int, old_days: int, new_days: int, keep_day: bool, target_day: int) -> int:
+    if old_days <= 0 or new_days <= 0:
+        raise ValueError("days-per-period must be positive")
     old_day_in_month = ((old_current - 1) % old_days) + 1
-    # Number of full months already completed:
     months_before = (old_current - old_day_in_month) // old_days
-    # Decide the day to use under the *new* system:
     if keep_day:
-        # keep the same ordinal day within the target month, but clamp if needed
         day_in_month = max(1, min(old_day_in_month, new_days))
     else:
-        # default: day 1 (this matches your August Day 1 workflow)
         day_in_month = target_day
         if not (1 <= day_in_month <= new_days):
             raise ValueError(f"Target day must be 1..{new_days}.")
-    # New linear day:
     new_current = months_before * new_days + day_in_month
-    return new_current, months_before, old_day_in_month, day_in_month
+    return new_current
 
-# --- ADDED: update plannedDaysPerPeriod in careerSavegame.xml (only change) ---
-def update_career_planned_days(save_dir: str, days_value: int, no_backup: bool, dry_run: bool):
-    career_path = os.path.join(save_dir, "careerSavegame.xml")
-    if not os.path.isfile(career_path):
-        print("[warn] careerSavegame.xml not found; skipping plannedDaysPerPeriod update.")
-        return
-    print(f"[info] Updating plannedDaysPerPeriod in: {career_path}")
+# -------------------------
+# careerSavegame.xml update
+# -------------------------
+def update_career_planned_days(save_dir: Path, days: int, no_backup: bool, dry_run: bool, verbose: bool = False):
+    career_path = save_dir / "careerSavegame.xml"
+    ensure_exists(career_path, "careerSavegame.xml")
+    if verbose:
+        print(f"[info] Opening {career_path}")
     tree = ET.parse(career_path)
     root = tree.getroot()
-    settings = root.find(".//settings") or root
+    settings = root.find("./settings")
+    if settings is None:
+        settings = ET.SubElement(root, "settings")
     node = settings.find("plannedDaysPerPeriod")
     if node is None:
         node = ET.SubElement(settings, "plannedDaysPerPeriod")
-    node.text = str(days_value)
-    if dry_run:
-        print("[info] Dry-run: careerSavegame.xml not written.")
-        return
-    if not no_backup:
-        bak = backup_file(career_path)
-        print(f"[info] Backup created: {bak}")
-    pretty_write_xml(tree, career_path)
-    print("[ok] careerSavegame.xml updated.")
+    current = (node.text or "").strip()
+    if current == str(days):
+        if verbose:
+            print(f"[info] plannedDaysPerPeriod already {current}; no change.")
+    else:
+        if verbose:
+            print(f"[info] plannedDaysPerPeriod: '{current}' -> '{days}'")
+        node.text = str(days)
+        if not dry_run and not no_backup:
+            bak = timestamped_backup(career_path)
+            if verbose:
+                print(f"[info] Backup created: {bak}")
+        if not dry_run:
+            tree.write(career_path, encoding="utf-8", xml_declaration=True)
+            if verbose:
+                print(f"[ok] careerSavegame.xml updated")
 
+# -------------------------
+# farms.xml statistics reset
+# -------------------------
+_FLOAT_RE = re.compile(r"^-?\d+\.\d+$")
+_INT_RE   = re.compile(r"^-?\d+$")
+
+def _zero_like(value: str) -> str:
+    val = (value or "").strip()
+    if _FLOAT_RE.match(val):
+        return "0.000000"
+    if _INT_RE.match(val):
+        return "0"
+    return "0"
+
+def reset_farm_statistics(farms_xml_path: Path, verbose: bool = False, dry_run: bool = False, no_backup: bool = False) -> int:
+    ensure_exists(farms_xml_path, "farms.xml")
+    if verbose:
+        print(f"[info] Opening {farms_xml_path}")
+    tree = ET.parse(farms_xml_path)
+    root = tree.getroot()
+    changed = 0
+    for farm in root.findall("./farm"):
+        stats = farm.find("statistics")
+        if stats is None:
+            continue
+        for node in list(stats):
+            if node.tag == "farmId":
+                continue
+            old = (node.text or "").strip()
+            new = _zero_like(old)
+            if old != new:
+                node.text = new
+                changed += 1
+                if verbose:
+                    print(f"[info]  {node.tag}: '{old}' -> '{new}'")
+    if changed > 0:
+        if not dry_run and not no_backup:
+            bak = timestamped_backup(farms_xml_path)
+            if verbose:
+                print(f"[info] Backup created: {bak}")
+        if not dry_run:
+            tree.write(farms_xml_path, encoding="utf-8", xml_declaration=True)
+            if verbose:
+                print(f"[ok] farms.xml statistics updated")
+    elif verbose:
+        print("[info] No statistic fields required changes.")
+    return changed
+
+# -------------------------
+# farms.xml finances reset
+# -------------------------
+
+def reset_farm_finances(farms_xml_path: Path, verbose: bool = False, dry_run: bool = False, no_backup: bool = False) -> int:
+    """
+    Zero out numeric values inside each <finances>/<stats> block for every <farm> in farms.xml.
+    Preserves numeric style (ints -> '0', floats -> '0.000000').
+    Returns the number of fields changed.
+    """
+    ensure_exists(farms_xml_path, "farms.xml")
+    if verbose:
+        print(f"[info] Opening {farms_xml_path}")
+    tree = ET.parse(farms_xml_path)
+    root = tree.getroot()
+    changed = 0
+
+    for farm in root.findall("./farm"):
+        finances = farm.find("finances")
+        if finances is None:
+            continue
+
+        for stats in finances.findall("stats"):
+            # Iterate all direct children under <stats> (and nested ones, to be safe).
+            for node in stats.iter():
+                if node is stats:
+                    continue  # skip the container element itself
+                # Only attempt to zero leaf nodes that have text content
+                text = (node.text or "").strip()
+                if text == "":
+                    continue
+                new_text = _zero_like(text)
+                if text != new_text:
+                    node.text = new_text
+                    changed += 1
+                    if verbose:
+                        print(f"[info]  finances.stats/{node.tag}: '{text}' -> '{new_text}'")
+
+    if changed > 0:
+        if not dry_run and not no_backup:
+            bak = timestamped_backup(farms_xml_path)
+            if verbose:
+                print(f"[info] Backup created: {bak}")
+        if not dry_run:
+            tree.write(farms_xml_path, encoding="utf-8", xml_declaration=True)
+            if verbose:
+                print(f"[ok] farms.xml finances values zeroed")
+    elif verbose:
+        print("[info] No finance values required changes.")
+    return changed
+
+# -------------------------
+# Main workflow
+# -------------------------
 def main():
-    ap = argparse.ArgumentParser(
-        description="FS25: set daysPerPeriod, recompute currentDay from existing values, and clear forecast cache."
-    )
-    ap.add_argument("--save", required=True,
-                    help="Path to the savegame folder (e.g. '.../FarmingSimulator2025/savegame1').")
-    ap.add_argument("--days", type=int, required=True,
-                    help="New days per month to set (1–28).")
-    ap.add_argument("--target-day", type=int, default=1,
-                    help="Day within the target month for the *new* system (ignored if --keep-day). Default: 1.")
-    ap.add_argument("--keep-day", action="store_true",
-                    help="Keep the same day-in-month as before (clamped to new days).")
-    ap.add_argument("--no-backup", action="store_true",
-                    help="Do not create a timestamped .bak file.")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="Parse and report what would change without writing.")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="FS25: adjust days-per-month; optional farms.xml stats/finances resets.")
+    parser.add_argument("--save", required=True,
+                        help="Save folder name (e.g., savegame1) or full path to a save folder.")
+    parser.add_argument("--days", type=int,
+                        help="Set days per month (daysPerPeriod). If omitted, no day change is applied.")
+    parser.add_argument("--day", type=int, default=1,
+                        help="Target day within current month after change (default: 1). Ignored with --keep-day.")
+    parser.add_argument("--keep-day", action="store_true",
+                        help="Keep the old day-in-month when changing days-per-month (clamped if needed).")
+    parser.add_argument("--reset-stats", action="store_true",
+                        help="Reset farms.xml <statistics> values to 0/0.000000 (keeps <farmId>).")
+    parser.add_argument("--reset-finances", action="store_true",
+                        help="Remove all <stats> entries inside <finances> for each farm in farms.xml.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Preview changes without writing files.")
+    parser.add_argument("--no-backup", action="store_true",
+                        help="Do not create .bak backups before writing.")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Verbose output.")
+    args = parser.parse_args()
 
-    save_dir = os.path.abspath(os.path.expanduser(args.save))
-    if not os.path.isdir(save_dir):
-        print(f"[error] Save folder not found: {save_dir}", file=sys.stderr)
-        sys.exit(2)
+    save_dir = Path(args.save)
+    if not save_dir.exists():
+        common = Path.home() / "Documents" / "My Games" / "FarmingSimulator2025" / args.save
+        if common.exists():
+            save_dir = common
+        else:
+            rel = Path.cwd() / args.save
+            if rel.exists():
+                save_dir = rel
+            else:
+                raise FileNotFoundError(f"Could not resolve save directory from '{args.save}'.")
+    if args.verbose:
+        print(f"[info] Save directory: {save_dir}")
 
-    try:
-        validate_days(args.days)
-    except ValueError as e:
-        print(f"[error] {e}", file=sys.stderr)
-        sys.exit(2)
+    # Independent operations on farms.xml
+    if args.reset_stats or args.reset_finances:
+        farms_xml = save_dir / "farms.xml"
+        if args.reset_stats:
+            reset_farm_statistics(farms_xml, verbose=args.verbose, dry_run=args.dry_run, no_backup=args.no_backup)
+        if args.reset_finances:
+            reset_farm_finances(farms_xml, verbose=args.verbose, dry_run=args.dry_run, no_backup=args.no_backup)
 
-    try:
-        env_path = find_env_xml(save_dir)
-    except FileNotFoundError as e:
-        print(f"[error] {e}", file=sys.stderr)
-        sys.exit(2)
+    # If no days change requested, stop here
+    if args.days is None:
+        if args.verbose:
+            print("[info] No --days provided; skipping days-per-month adjustments.")
+        return
 
-    print(f"[info] Using environment file: {env_path}")
+    # environment.xml
+    env_path = find_environment_xml(save_dir)
+    ensure_exists(env_path, "environment.xml")
+    if args.verbose:
+        print(f"[info] Using environment.xml: {env_path}")
 
     tree = ET.parse(env_path)
     root = tree.getroot()
 
-    # Read existing values (defaults match FS25 fresh-save behavior: days=1, currentDay=6)
-    _, old_days_text = find_or(root, PRIMARY_DAY_TAG, default=None)
-    if old_days_text is None:
-        # try synonyms
-        for tag in DAY_TAG_SYNONYMS:
-            _, old_days_text = find_or(root, tag, default=None)
-            if old_days_text is not None:
-                break
-    old_days = int(old_days_text) if old_days_text not in (None, "") else 1
+    # read old daysPerPeriod (default 3)
+    current_days_node = root.find(f".//{PRIMARY_DAY_TAG}")
+    if current_days_node is None:
+        old_days = 3
+    else:
+        try:
+            old_days = int((current_days_node.text or "3").strip())
+        except Exception:
+            old_days = 3
 
-    _, old_current_text = find_or(root, "currentDay", default=None)
-    old_current = int(old_current_text) if old_current_text not in (None, "") else 6
+    new_days = args.days
+    if args.verbose:
+        print(f"[info] daysPerPeriod: old={old_days}, new={new_days}")
 
-    print(f"[info] Detected old settings: daysPerPeriod={old_days}, currentDay={old_current}")
+    # read currentDay (default 1)
+    current_day_node = root.find(".//currentDay")
+    if current_day_node is None:
+        old_current = 1
+    else:
+        try:
+            old_current = int((current_day_node.text or "1").strip())
+        except Exception:
+            old_current = 1
+    if args.verbose:
+        print(f"[info] currentDay (before): {old_current}")
 
-    # Recompute currentDay under new days-per-period
-    try:
-        new_current, months_before, old_dim, new_dim = recompute_current_day(
-            old_current, old_days, args.days, args.target_day, args.keep_day
-        )
-    except ValueError as e:
-        print(f"[error] {e}", file=sys.stderr)
-        sys.exit(2)
+    new_current = compute_new_current_day(
+        old_current=old_current,
+        old_days=old_days,
+        new_days=new_days,
+        keep_day=args.keep_day,
+        target_day=args.day
+    )
+    if args.verbose:
+        print(f"[info] currentDay (after):  {new_current}")
 
-    print(f"[calc] months_before={months_before} (full months already elapsed under old system)")
-    print(f"[calc] old_day_in_month={old_dim} -> new_day_in_month={new_dim}")
-    print(f"[calc] new currentDay = {new_current} (months_before*{args.days} + day_in_month)")
+    set_days_per_period(root, new_days)
 
-    # 1) Force daysPerPeriod (and sync synonyms if present)
-    set_days_per_period(root, args.days)
-    print(f"[info] Set daysPerPeriod = {args.days} (synced any existing synonyms).")
+    current_day_node = root.find(".//currentDay")
+    if current_day_node is None:
+        parent = root.find(".//environment") or root
+        current_day_node = ET.SubElement(parent, "currentDay")
+    current_day_node.text = str(new_current)
 
-    # 2) Set recomputed currentDay
-    env = root if root.tag == "environment" else (root.find(".//environment") or root)
-    node = env.find("currentDay")
-    if node is None:
-        node = ET.SubElement(env, "currentDay")
-    node.text = str(new_current)
-    print(f"[info] Set currentDay = {new_current}")
-
-    # 3) Clear cached forecast entries so FS25 regenerates them on load
     removed = clear_forecast(root)
-    print(f"[info] Cleared {removed} cached forecast entries/objects.")
+    if args.verbose:
+        print(f"[info] Cleared forecast entries: {removed}")
 
-    if args.dry_run:
-        print("[info] Dry-run mode: no files written.")
-        sys.exit(0)
+    if not args.dry_run and not args.no_backup:
+        bak = timestamped_backup(env_path)
+        if args.verbose:
+            print(f"[info] Backup created: {bak}")
+    if not args.dry_run:
+        pretty_write_xml(tree, env_path)
+        if args.verbose:
+            print("[ok] environment.xml updated]")
 
-    if not args.no_backup:
-        bak = backup_file(env_path)
-        print(f"[info] Backup created: {bak}")
+    update_career_planned_days(save_dir, new_days, args.no_backup, args.dry_run, verbose=args.verbose)
 
-    # --- ADDED: keep UI/engine in sync by updating careerSavegame.xml plannedDaysPerPeriod ---
-    update_career_planned_days(save_dir, args.days, args.no_backup, args.dry_run)
-
-    pretty_write_xml(tree, env_path)
-    print("[ok] environment.xml updated. Launch the save; FS25 will regenerate the forecast on load.")
+    if args.verbose:
+        print("[done] All requested operations completed.")
 
 if __name__ == "__main__":
     main()
