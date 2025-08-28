@@ -114,6 +114,29 @@ def recompute_current_day(old_current: int, old_days: int, new_days: int, target
     new_current = months_before * new_days + day_in_month
     return new_current, months_before, old_day_in_month, day_in_month
 
+# --- ADDED: update plannedDaysPerPeriod in careerSavegame.xml (only change) ---
+def update_career_planned_days(save_dir: str, days_value: int, no_backup: bool, dry_run: bool):
+    career_path = os.path.join(save_dir, "careerSavegame.xml")
+    if not os.path.isfile(career_path):
+        print("[warn] careerSavegame.xml not found; skipping plannedDaysPerPeriod update.")
+        return
+    print(f"[info] Updating plannedDaysPerPeriod in: {career_path}")
+    tree = ET.parse(career_path)
+    root = tree.getroot()
+    settings = root.find(".//settings") or root
+    node = settings.find("plannedDaysPerPeriod")
+    if node is None:
+        node = ET.SubElement(settings, "plannedDaysPerPeriod")
+    node.text = str(days_value)
+    if dry_run:
+        print("[info] Dry-run: careerSavegame.xml not written.")
+        return
+    if not no_backup:
+        bak = backup_file(career_path)
+        print(f"[info] Backup created: {bak}")
+    pretty_write_xml(tree, career_path)
+    print("[ok] careerSavegame.xml updated.")
+
 def main():
     ap = argparse.ArgumentParser(
         description="FS25: set daysPerPeriod, recompute currentDay from existing values, and clear forecast cache."
@@ -205,6 +228,9 @@ def main():
     if not args.no_backup:
         bak = backup_file(env_path)
         print(f"[info] Backup created: {bak}")
+
+    # --- ADDED: keep UI/engine in sync by updating careerSavegame.xml plannedDaysPerPeriod ---
+    update_career_planned_days(save_dir, args.days, args.no_backup, args.dry_run)
 
     pretty_write_xml(tree, env_path)
     print("[ok] environment.xml updated. Launch the save; FS25 will regenerate the forecast on load.")
